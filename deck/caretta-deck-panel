@@ -1,0 +1,727 @@
+#!/usr/bin/env python3
+"""caretta-deck-panel: Caretta's deck. One window, drawn purple panels on a white ground, the turtle on its cells, a lilac accent.
+
+Keys: y n p s l t as on the design page; r rest, d restart the deck, o shut down and b reboot (both ask first).
+Nothing here is invented: with no agent running, the agent panels say so.
+
+  caretta-deck-panel                 the window, under sway
+  caretta-deck-panel --png out.png   one frame to a file
+  caretta-deck-panel --greeter       the login screen, as the face of greetd: asks the password, then starts the deck
+"""
+import os, sys, time, math, subprocess, threading, getpass, json, socket, struct, pwd, glob
+import ctypes, ctypes.util
+import gi
+gi.require_version('Pango', '1.0'); gi.require_version('PangoCairo', '1.0')
+from gi.repository import Pango, PangoCairo
+import cairo
+
+INK, SUN, LEAF, LEAF2, DEEP, DUSK = '#361534', '#f1efe9', '#598A5C', '#7aa876', '#41694a', '#a88aa4'
+GROUND = '#f1efe9'                     # what lies between the panels
+ACC = '#B890E6'                        # the accent: the turtle, the name, the live marks
+SERIF, MONO = 'Spline Sans Mono', 'Spline Sans Mono'   # one typeface; the large letters are only bolder
+HEADW = 600   # the weight of the large letters
+W, H = 1440, 900                       # the design size, and this screen's own size
+ART = os.environ.get('KIMERA_ART', '/usr/local/share/kimera/caretta-deck.png')
+REST_ART = os.path.join(os.path.dirname(ART), 'caretta-rest.png')
+LOGIN_CELLS = os.path.join(os.path.dirname(ART), 'caretta-login-cells.png')
+LOGIN_TURTLE = os.path.join(os.path.dirname(ART), 'caretta-login-turtle.png')
+REST_AFTER = 300                       # seconds without a key before the deck rests
+AGENT_PROGRAM = os.environ.get('KIMERA_AGENT', 'claude')    # a running program of this name counts as one agent
+BADGE = os.environ.get('KIMERA_BADGE', 'LIMB 1')            # the small pill above the name
+MACHINE = os.environ.get('KIMERA_MACHINE', 'MacBook Air 2013')   # the line under the name; yours will differ
+HZ = os.sysconf('SC_CLK_TCK'); PAGE = os.sysconf('SC_PAGE_SIZE'); NCPU = os.cpu_count() or 1
+CONTROL = [('y', 'say yes'), ('n', 'say no'), ('p', 'pause all'), ('s', 'stop agent'),
+           ('l', 'lock'), ('t', 'terminal'), ('r', 'rest'), ('d', 'restart deck'),
+           ('o', 'shut down'), ('b', 'reboot')]
+
+
+class _Msg(ctypes.Structure): _fields_ = [('style', ctypes.c_int), ('msg', ctypes.c_char_p)]
+class _Resp(ctypes.Structure): _fields_ = [('resp', ctypes.c_void_p), ('code', ctypes.c_int)]
+_CONV = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.POINTER(_Msg)),
+                         ctypes.POINTER(ctypes.POINTER(_Resp)), ctypes.c_void_p)
+class _Conv(ctypes.Structure): _fields_ = [('conv', _CONV), ('data', ctypes.c_void_p)]
+
+
+def pam():
+    """The system's own password check (the library the login uses), or None when it cannot be loaded."""
+    try:
+        lp = ctypes.CDLL(ctypes.util.find_library('pam') or 'libpam.so.0')
+        lc = ctypes.CDLL(ctypes.util.find_library('c') or 'libc.so.6')
+        lc.calloc.restype = ctypes.c_void_p; lc.calloc.argtypes = [ctypes.c_size_t, ctypes.c_size_t]
+        lc.strdup.restype = ctypes.c_void_p; lc.strdup.argtypes = [ctypes.c_char_p]
+        lp.pam_start.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(_Conv), ctypes.POINTER(ctypes.c_void_p)]
+        lp.pam_authenticate.argtypes = [ctypes.c_void_p, ctypes.c_int]; lp.pam_end.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lp.pam_acct_mgmt.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        return lp, lc
+    except OSError: return None
+
+
+def password_ok(word, service='swaylock'):
+    """True when word is this user's password. The system answers; the word is not written anywhere (Python cannot wipe it from memory)."""
+    libs = pam()
+    if not libs: return False
+    lp, lc = libs; secret = word.encode()
+
+    @_CONV
+    def conv(n, msgs, resp, _data):
+        addr = lc.calloc(n, ctypes.sizeof(_Resp))
+        if not addr: return 5
+        resp[0] = ctypes.cast(addr, ctypes.POINTER(_Resp))
+        for i in range(n):
+            if msgs[i].contents.style == 1: resp[0][i].resp = lc.strdup(secret)      # 1: a hidden prompt
+        return 0
+
+    h = ctypes.c_void_p(); c = _Conv(conv, None)
+    if lp.pam_start(service.encode(), pwd.getpwuid(os.getuid()).pw_name.encode(), ctypes.byref(c), ctypes.byref(h)) != 0: return False
+    r = lp.pam_authenticate(h, 0)
+    if r == 0: r = lp.pam_acct_mgmt(h, 0)            # an expired or locked account does not unlock
+    lp.pam_end(h, r)
+    return r == 0
+
+
+def rgb(h): return tuple(int(h[i:i + 2], 16) / 255 for i in (1, 3, 5))
+
+
+def text(cr, x, y, s, size, col, fam=MONO, weight=400, anchor='start', spacing=0):
+    lay = PangoCairo.create_layout(cr)
+    fd = Pango.FontDescription(); fd.set_family(fam); fd.set_absolute_size(size * Pango.SCALE)
+    fd.set_weight(Pango.Weight(weight)); lay.set_font_description(fd)
+    if spacing:
+        al = Pango.AttrList(); al.insert(Pango.attr_letter_spacing_new(int(spacing * Pango.SCALE))); lay.set_attributes(al)
+    lay.set_text(s, -1)
+    w = lay.get_size()[0] / Pango.SCALE - spacing
+    if anchor == 'end': x -= w
+    elif anchor == 'middle': x -= w / 2
+    cr.set_source_rgb(*rgb(col)); cr.move_to(x, y - lay.get_baseline() / Pango.SCALE)
+    PangoCairo.show_layout(cr, lay)
+    return w
+
+
+def wordmark(cr, x, y, size, anchor='start'):
+    """The word CARETTA, the same everywhere: heavy letters, lilac, with an ink outline. Returns its width."""
+    lay = PangoCairo.create_layout(cr); fd = Pango.FontDescription(); fd.set_family(MONO)
+    fd.set_absolute_size(size * Pango.SCALE); fd.set_weight(Pango.Weight(700)); lay.set_font_description(fd)
+    lay.set_text('CARETTA', -1); w = lay.get_size()[0] / Pango.SCALE
+    if anchor == 'middle': x -= w / 2
+    cr.move_to(x, y - lay.get_baseline() / Pango.SCALE); PangoCairo.layout_path(cr, lay)
+    cr.set_source_rgb(*rgb(INK)); cr.set_line_width(max(2, size * 0.093)); cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    cr.stroke_preserve(); cr.set_source_rgb(*rgb(ACC)); cr.fill()
+    return w
+
+
+def rect(cr, x, y, w, h, fill=None, line=None, lw=3, r=0):
+    if r:
+        cr.new_sub_path()
+        for cx, cy, a in ((x + w - r, y + r, -1), (x + w - r, y + h - r, 0), (x + r, y + h - r, 1), (x + r, y + r, 2)):
+            cr.arc(cx, cy, r, a * math.pi / 2, (a + 1) * math.pi / 2)
+        cr.close_path()
+    else: cr.rectangle(x, y, w, h)
+    if fill:
+        cr.set_source_rgb(*rgb(fill))
+        cr.fill_preserve() if line else cr.fill()
+    if line: cr.set_source_rgb(*rgb(line)); cr.set_line_width(lw); cr.stroke()
+
+
+def pill(cr, x, y, w, label, fill=LEAF, ink=INK, h=28, size=14, line=None, spacing=1.4):
+    rect(cr, x, y, w, h, fill, line, 2.6, h / 2)
+    text(cr, x + w / 2, y + h / 2 + size * 0.36, label, size, ink, MONO, 600, 'middle', spacing)
+
+
+def panel(cr, x, y, w, h): rect(cr, x, y, w, h, INK, INK, 3)
+
+
+class State:
+    def __init__(self):
+        self.msg = ''; self.off_until = 0.0; self.off_kind = 'off'
+        self.resting = False; self.last_key = time.time()
+        self.mouse = None; self.zones = []; self.scroll = 0; self.info = {}; self._wifi = (0, None)
+        self.locked = False; self.typed = ''; self.checking = False; self.wrong_until = 0.0; self.wrong_n = 0
+        self.user = ''; self.stage = 0; self.wrong_u = 0     # the name row comes first, then the password row
+        self.hist = []; self.load = 0.0; self.procs = []; self.agents = 0; self.agent_mem = 0
+        self._cpu = None; self._pt = {}; self._t = None
+        self.sample()
+
+    def sample(self):
+        now = time.monotonic()
+        with open('/proc/stat') as f: v = [int(x) for x in f.readline().split()[1:9]]
+        total, idle, system = sum(v), v[3] + v[4], v[2] + v[5] + v[6]
+        if self._cpu and total > self._cpu[0]:
+            d = total - self._cpu[0]
+            self.load = 1 - (idle - self._cpu[1]) / d
+            self.hist = (self.hist + [(self.load, (system - self._cpu[2]) / d)])[-40:]
+        self._cpu = (total, idle, system)
+        dt = (now - self._t) if self._t else 0
+        seen, rows, agents, amem = {}, [], 0, 0
+        for pid in os.listdir('/proc'):
+            if not pid.isdigit(): continue
+            try:
+                with open(f'/proc/{pid}/stat') as f: s = f.read()
+            except OSError: continue
+            name = s[s.index('(') + 1:s.rindex(')')]; r = s[s.rindex(')') + 2:].split()
+            ticks, rss = int(r[11]) + int(r[12]), int(r[21]) * PAGE
+            seen[pid] = ticks
+            if rss == 0: continue
+            if name == AGENT_PROGRAM: agents += 1; amem += rss
+            pct = 100 * (ticks - self._pt[pid]) / (dt * HZ * NCPU) if dt > 0 and pid in self._pt else 0.0
+            rows.append((name, rss, pct))
+        self._pt = seen; self._t = now; self.agents = agents; self.agent_mem = amem
+        self.procs = sorted(rows, key=lambda p: (-round(p[2], 1), -p[1]))[:12]
+        self.scroll = max(0, min(self.scroll, len(self.procs) - 4))
+        self.info = self._info()
+
+    def _info(self):
+        """The small things behind the icons. Each is read from the system; what cannot be read is left out."""
+        def read(path):
+            try:
+                with open(path) as f: return f.read().strip()
+            except OSError: return None
+        i = {}
+        for b in glob.glob('/sys/class/power_supply/BAT*'):
+            c = read(b + '/capacity')
+            if c: i['battery'] = (int(c), (read(b + '/status') or '').lower()); break
+        for line in (read('/proc/net/wireless') or '').splitlines()[2:]:
+            f = line.split(); q = int(float(f[2].rstrip('.'))); i['wifi'] = (round(q / 70 * 100), f"on {f[0].rstrip(':')}"); break
+        if 'wifi' not in i:                        # some drivers do not fill that file: ask the network manager, every 10 s
+            if time.time() - self._wifi[0] > 10:
+                try:
+                    out = subprocess.run(['nmcli', '-t', '-f', 'IN-USE,SIGNAL', 'dev', 'wifi', 'list', '--rescan', 'no'],
+                                         capture_output=True, text=True, timeout=2).stdout
+                    hit = [l.split(':')[1] for l in out.splitlines() if l.startswith('*:')]
+                    self._wifi = (time.time(), int(hit[0]) if hit else None)
+                except (OSError, ValueError, IndexError, subprocess.SubprocessError): self._wifi = (time.time(), None)
+            if self._wifi[1] is not None: i['wifi'] = (self._wifi[1], 'signal, from the network manager')
+        temps = [int(t) / 1000 for t in (read(z) for z in glob.glob('/sys/class/thermal/thermal_zone*/temp')) if t and t.lstrip('-').isdigit()]
+        if temps: i['temp'] = max(temps)
+        fans = [int(r) for r in (read(f) for f in glob.glob('/sys/class/hwmon/hwmon*/fan*_input') + glob.glob('/sys/devices/platform/applesmc.*/fan*_input')) if r and r.isdigit()]
+        if fans: i['fan'] = max(fans)
+        d = os.statvfs('/'); i['disk'] = (d.f_bavail * d.f_frsize, d.f_blocks * d.f_frsize)
+        try: i['remote'] = sum(1 for n in os.listdir('/dev/pts') if n.isdigit())
+        except OSError: pass
+        return i
+
+    def memory(self):
+        m = {}
+        with open('/proc/meminfo') as f:
+            for line in f: k, v = line.split(':'); m[k] = int(v.split()[0]) * 1024
+        total, free = m['MemTotal'], m['MemAvailable']
+        agents = min(self.agent_mem, total - free)
+        return total, free, agents, max(0, total - free - agents)
+
+
+def gb(b): return f'{b / 2**30:.1f}'
+
+
+def size(b): return f'{b / 2**30:.1f}G' if b >= 2**30 else f'{b / 2**20:.0f}M'
+
+
+def uptime():
+    with open('/proc/uptime') as f: s = float(f.read().split()[0])
+    for n, unit in ((86400, 'day'), (3600, 'hour'), (60, 'minute')):
+        if s >= n: k = int(s // n); return f'up {k} {unit}' + ('s' if k != 1 else '')
+    return 'up a moment'
+
+
+def area(cr, vals, x0, x1, base, top, fill, line=None):
+    """A filled curve of vals (0..1) from x0 to x1, standing on base."""
+    if len(vals) < 2: return
+    step = (x1 - x0) / 39; start = x1 - step * (len(vals) - 1)
+    pts = [(start + i * step, base - 6 - v * (base - 6 - top)) for i, v in enumerate(vals)]
+    def trace():
+        cr.move_to(*pts[0])
+        for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+            mx = (ax + bx) / 2; cr.curve_to(mx, ay, mx, by, bx, by)
+    trace(); cr.line_to(pts[-1][0], base); cr.line_to(pts[0][0], base); cr.close_path()
+    cr.set_source_rgb(*rgb(fill)); cr.fill()
+    if line: trace(); cr.set_source_rgb(*rgb(line)); cr.set_line_width(3); cr.stroke()
+
+
+def zone(st, x, y, w, h, title, *lines):
+    """Marks a place the pointer can rest on, and what to say there."""
+    st.zones.append((x, y, w, h, title, lines))
+
+
+def icon(cr, st, x, kind, title, *lines, level=None):
+    """One round chip in the bar: a small drawing, and its words when the pointer rests on it."""
+    cx, cy = x + 20, 38
+    rect(cr, x, 18, 40, 40, GROUND, INK, 2.6, 20)
+    cr.set_source_rgb(*rgb(INK)); cr.set_line_width(2.4); cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    if kind == 'battery':
+        cr.rectangle(cx - 11, cy - 6, 20, 12); cr.stroke(); cr.rectangle(cx + 10, cy - 3, 2.5, 6); cr.fill()
+        cr.set_source_rgb(*rgb(LEAF if (level or 0) > 0.25 else ACC)); cr.rectangle(cx - 8.5, cy - 3.5, 15 * max(0.08, level or 0), 7); cr.fill()
+    elif kind == 'wifi':
+        for k, r in enumerate((5, 10, 15)):
+            cr.set_source_rgb(*rgb(INK if (level or 0) >= (k + 1) / 3 - 0.2 else DUSK))
+            cr.arc(cx, cy + 8, r, -2.36, -0.78); cr.stroke()
+        cr.set_source_rgb(*rgb(INK)); cr.arc(cx, cy + 8, 1.8, 0, 6.2832); cr.fill()
+    elif kind == 'temp':
+        cr.move_to(cx, cy - 10); cr.line_to(cx, cy + 3); cr.stroke(); cr.arc(cx, cy + 6, 5, 0, 6.2832); cr.fill()
+        cr.set_line_width(5.5); cr.set_source_rgba(*rgb(INK), 0.25); cr.move_to(cx, cy - 10); cr.line_to(cx, cy + 3); cr.stroke()
+    elif kind == 'disk':
+        for dy in (-7, 0, 7):
+            cr.save(); cr.translate(cx, cy + dy); cr.scale(1, 0.38); cr.arc(0, 0, 10, 0, 6.2832); cr.restore(); cr.stroke()
+    elif kind == 'remote':
+        cr.move_to(cx - 9, cy - 6); cr.line_to(cx - 2, cy); cr.line_to(cx - 9, cy + 6); cr.stroke()
+        cr.move_to(cx + 1, cy + 7); cr.line_to(cx + 10, cy + 7); cr.stroke()
+    elif kind == 'up':
+        cr.arc(cx, cy, 10, 0, 6.2832); cr.stroke(); cr.move_to(cx, cy - 6); cr.line_to(cx, cy); cr.line_to(cx + 5, cy + 3); cr.stroke()
+    cr.set_line_cap(cairo.LINE_CAP_BUTT)
+    zone(st, x, 18, 40, 40, title, *lines)
+
+
+def ipill(cr, x, w, kind, label, fill, level=0.0):
+    """A bar pill with a small drawing at its left: agents (a face), load (a dial), memory (a chip)."""
+    rect(cr, x, 18, w, 40, fill, INK, 2.6, 20)
+    cx, cy = x + 22, 38
+    cr.set_source_rgb(*rgb(INK)); cr.set_line_width(2.2); cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    if kind == 'agents':
+        rect(cr, cx - 8, cy - 6, 16, 13, None, INK, 2.2, 4)
+        cr.arc(cx - 3.2, cy, 1.5, 0, 6.2832); cr.fill(); cr.arc(cx + 3.2, cy, 1.5, 0, 6.2832); cr.fill()
+        cr.move_to(cx, cy - 6); cr.line_to(cx, cy - 10); cr.stroke(); cr.arc(cx, cy - 11, 1.4, 0, 6.2832); cr.fill()
+    elif kind == 'load':
+        cr.arc(cx, cy + 5, 10, math.pi, 2 * math.pi); cr.stroke()
+        a = math.pi * (1 + max(0.0, min(1.0, level)))
+        cr.move_to(cx, cy + 5); cr.line_to(cx + 8 * math.cos(a), cy + 5 + 8 * math.sin(a)); cr.stroke()
+        cr.arc(cx, cy + 5, 1.6, 0, 6.2832); cr.fill()
+    elif kind == 'mem':
+        cr.rectangle(cx - 6, cy - 6, 12, 12); cr.stroke(); cr.set_line_width(1.8)
+        for d in (-3, 3):
+            for ax, ay, bx, by in ((d, -6, d, -10), (d, 6, d, 10), (-6, d, -10, d), (6, d, 10, d)):
+                cr.move_to(cx + ax, cy + ay); cr.line_to(cx + bx, cy + by); cr.stroke()
+    cr.set_line_cap(cairo.LINE_CAP_BUTT)
+    text(cr, x + 38 + (w - 38 - 12) / 2, 43, label, 13, INK, MONO, 600, 'middle', 0.6)
+
+
+def tooltip(cr, st):
+    """The words for the place under the pointer, on a slip of paper beside it."""
+    if not st.mouse: return
+    mx, my = st.mouse
+    for x, y, w, h, title, lines in reversed(st.zones):
+        if x <= mx <= x + w and y <= my <= y + h: break
+    else: return
+    lay = PangoCairo.create_layout(cr); fd = Pango.FontDescription(); fd.set_family(MONO); fd.set_absolute_size(15 * Pango.SCALE)
+    lay.set_font_description(fd); widths = []
+    for t in (title,) + tuple(lines): lay.set_text(t, -1); widths.append(lay.get_size()[0] / Pango.SCALE)
+    bw = max(widths) + 44; bh = 40 + 22 * len(lines)
+    bx = min(max(8, mx + 14), W - bw - 8); by = my + 22 if my + 22 + bh < H - 8 else my - bh - 12
+    rect(cr, bx + 5, by + 5, bw, bh, INK); rect(cr, bx, by, bw, bh, SUN, INK, 3)
+    text(cr, bx + 16, by + 26, title, 15, INK, MONO, 700)
+    for k, t in enumerate(lines): text(cr, bx + 16, by + 49 + k * 22, t, 15, INK)
+
+
+def draw(cr, st):
+    st.zones = []
+    total, free, agents, system = st.memory()
+    # the bar: the name's pill and turtle are in the artwork
+    wordmark(cr, 123, 45, 18, 'middle')
+    pill(cr, 548, 18, 344, time.strftime('%a %d %b %Y · %H:%M:%S').upper(), GROUND, INK, 40, 15, INK, 1.6)
+    i = st.info; ix = 212
+    if 'battery' in i:
+        pct, how = i['battery']; icon(cr, st, ix, 'battery', f'Battery {pct}%', how or 'state unknown', level=pct / 100); ix += 50
+    if 'wifi' in i:
+        q, how = i['wifi']; icon(cr, st, ix, 'wifi', f'Wi-Fi {q}%', how, level=q / 100); ix += 50
+    if 'temp' in i:
+        icon(cr, st, ix, 'temp', f"{i['temp']:.0f} °C", 'the warmest sensor', *([f"fan {i['fan']} turns a minute"] if 'fan' in i else [])); ix += 50
+    df, dt = i.get('disk', (0, 1))
+    icon(cr, st, ix, 'disk', f'{gb(df)} GB free on disk', f'of {gb(dt)} GB for Kimera'); ix += 50
+    if 'remote' in i:
+        r = i['remote']; icon(cr, st, ix, 'remote', f"{r} terminal{'' if r == 1 else 's'} open", 'here and from other machines'); ix += 50
+    icon(cr, st, ix, 'up', uptime().replace('up ', 'Running for '), time.strftime('week %V, day %j of the year'))
+    zone(st, 548, 18, 344, 40, time.strftime('%A %d %B %Y'), time.strftime('week %V · day %j of the year'))
+    zone(st, 992, 18, 138, 40, f"{st.agents} agent{'' if st.agents == 1 else 's'} running", f'using {gb(agents)} GB of memory')
+    zone(st, 1142, 18, 118, 40, f'Load {st.load * NCPU:.1f} of {NCPU}', f'{round(st.load * 100)}% of the processor', f'{NCPU} threads')
+    zone(st, 1272, 18, 150, 40, f'{gb(total - free)} GB used of {gb(total)}', f'agents {gb(agents)} · system {gb(system)}', f'free {gb(free)} GB')
+    n = st.agents
+    ipill(cr, 992, 138, 'agents', f"{n} AGENT{'' if n == 1 else 'S'}", LEAF if n else GROUND)
+    ipill(cr, 1142, 118, 'load', f'LOAD {st.load * NCPU:.1f}', GROUND, st.load)
+    ipill(cr, 1272, 150, 'mem', f'MEM {gb(total - free)}/{gb(total)}', GROUND)
+
+    # agents: what each is doing. Nothing reports yet, so it says so.
+    panel(cr, 18, 76, 880, 304)
+    text(cr, 42, 112, 'agents', 19, LEAF2, MONO, 600)
+    pill(cr, 708, 92, 170, 'RUNNING' if n else 'NONE YET')
+    cr.set_source_rgb(*rgb(LEAF)); cr.set_line_width(2); cr.move_to(42, 132); cr.line_to(874, 132); cr.stroke()
+    if n:
+        text(cr, 42, 200, f"{n} agent{'' if n == 1 else 's'} running", 32, SUN, SERIF, HEADW, spacing=1)
+        text(cr, 42, 244, 'what each one is doing is not shown here yet', 17, LEAF2)
+    else:
+        text(cr, 42, 200, 'No agent is working', 32, SUN, SERIF, HEADW, spacing=1)
+        text(cr, 42, 244, 'when one runs, its task and its last steps are listed here', 17, LEAF2)
+
+    # the one that needs you: purple while quiet, paper when an agent asks
+    panel(cr, 18, 394, 880, 296)
+    text(cr, 44, 432, 'needs you', 19, LEAF2, MONO, 600)
+    pill(cr, 686, 412, 190, 'NOTHING WAITS')
+    text(cr, 44, 520, 'Nothing is waiting for an answer', 32, SUN, SERIF, HEADW, spacing=1)
+    text(cr, 44, 564, 'a question from an agent turns this panel to paper', 17, LEAF2)
+
+    # tasks: the processor over the last minute and a half, and the heaviest four
+    panel(cr, 18, 704, 880, 178)
+    pill(cr, 38, 722, 88, 'TASKS')
+    text(cr, 142, 742, f'processor {round(st.load * 100)}%', 16, SUN, MONO, 500)
+    area(cr, [a for a, _ in st.hist], 40, 440, 868, 768, LEAF)
+    area(cr, [b for _, b in st.hist], 40, 440, 868, 768, DEEP)
+    if len(st.hist) > 1:
+        step = 400 / 39; start = 440 - step * (len(st.hist) - 1)
+        pts = [(start + i * step, 862 - a * 94) for i, (a, _) in enumerate(st.hist)]   # the same curve as the area
+        cr.move_to(*pts[0])
+        for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+            mx = (ax + bx) / 2; cr.curve_to(mx, ay, mx, by, bx, by)
+        cr.set_source_rgb(*rgb(ACC)); cr.set_line_width(3); cr.stroke()
+    text(cr, 480, 770, 'program', 15, LEAF2); text(cr, 760, 770, 'memory', 15, LEAF2, MONO, 400, 'end')
+    text(cr, 876, 770, '%', 15, LEAF2, MONO, 400, 'end')
+    shown = st.procs[st.scroll:st.scroll + 4]
+    for i, (name, rss, pct) in enumerate(shown):
+        y = 798 + i * 25; first = st.scroll + i == 0
+        text(cr, 480, y, name[:20], 17, SUN, MONO, 600 if first else 400)
+        text(cr, 760, y, size(rss), 17, LEAF2, MONO, 400, 'end'); text(cr, 870, y, f'{pct:.1f}', 17, ACC, MONO, 600, 'end')
+        zone(st, 470, y - 19, 412, 25, name, f'{size(rss)} of memory', f'{pct:.1f}% of the processor', f'place {st.scroll + i + 1} of {len(st.procs)}')
+    if len(st.procs) > 4:                          # a thin bar at the edge: where this window sits in the list
+        rect(cr, 884, 780, 4, 96, DEEP); k = len(st.procs)
+        rect(cr, 884, 780 + 96 * st.scroll / k, 4, 96 * 4 / k, ACC)
+    zone(st, 38, 722, 400, 150, 'Processor, last 80 seconds', 'green: all work', 'dark green: the system itself')
+
+    # the name, beside the turtle on its cells (the artwork)
+    rect(cr, 1112, 76, 310, 224, INK); rect(cr, 912, 76, 510, 224, None, INK, 3)
+    pill(cr, 1132, 102, 110, BADGE, SUN)
+    wordmark(cr, 1130, 206, 60)
+    cr.set_source_rgb(*rgb(ACC)); cr.set_line_width(2); cr.move_to(1132, 222); cr.line_to(1402, 222); cr.stroke()
+    text(cr, 1132, 252, MACHINE, 15, LEAF2, MONO, 500); text(cr, 1132, 276, 'Debian 13 · sway', 15, LEAF2, MONO, 500)
+
+    # memory, in three parts
+    panel(cr, 912, 314, 510, 156)
+    pill(cr, 932, 332, 100, 'MEMORY'); text(cr, 1400, 352, f'of {gb(total)} GB', 16, LEAF2, MONO, 400, 'end')
+    text(cr, 934, 408, f'{gb(free)} GB FREE', 40, SUN, SERIF, HEADW, spacing=1)
+    full = 467; wa = full * agents / total; ws = full * system / total
+    if wa > 1: rect(cr, 932, 422, wa, 14, ACC)
+    rect(cr, 932 + wa + (4 if wa > 1 else 0), 422, ws, 14, LEAF)
+    fx = 932 + wa + (4 if wa > 1 else 0) + ws + 5
+    rect(cr, fx, 423, max(4, 1399 - fx), 12, None, SUN, 2)
+    text(cr, 932, 460, f'agents {gb(agents)}', 15, ACC, MONO, 500); text(cr, 1071, 460, f'sys {gb(system)}', 15, LEAF2, MONO, 500)
+    text(cr, 1400, 460, f'free {gb(free)}', 15, SUN, MONO, 500, 'end')
+
+    # the ledger: nothing writes to it yet
+    panel(cr, 912, 484, 510, 166)
+    pill(cr, 932, 502, 92, 'LEDGER'); text(cr, 1400, 522, uptime(), 16, LEAF2, MONO, 400, 'end')
+    text(cr, 936, 564, 'nothing yet', 17, SUN); text(cr, 936, 595, 'what the agents did is listed here', 15, LEAF2)
+
+    # control
+    panel(cr, 912, 664, 510, 218)
+    pill(cr, 932, 682, 104, 'CONTROL')
+    for i, (k, v) in enumerate(CONTROL):
+        x = 936 + (i // 4) * 164; y = 738 + (i % 4) * 26
+        text(cr, x, y, k, 17, LEAF2, MONO, 600); text(cr, x + 26, y, v, 16, SUN)
+    cr.set_source_rgb(*rgb(LEAF)); cr.set_line_width(2); cr.move_to(932, 832); cr.line_to(1402, 832); cr.stroke()
+    w = wordmark(cr, 936, 864, 18); w += text(cr, 936 + w + 8, 864, '›', 18, LEAF2, MONO, 600) + 8
+    if st.msg: w += 12 + text(cr, 936 + w + 12, 864, st.msg, 17, SUN)
+    rect(cr, 936 + w + 12, 847, 11, 22, ACC)
+    tooltip(cr, st)
+    confirm_off(cr, st)
+
+
+def confirm_off(cr, st):
+    """The shut-down question, as the paper panel: Y shuts down, N or Esc keeps running, 15 s and it goes away."""
+    left = st.off_until - time.time()
+    if left <= 0: return
+    cr.set_source_rgba(*rgb(INK), 0.82); cr.rectangle(0, 0, W, H); cr.fill()
+    rect(cr, 360, 290, 720, 300, SUN, INK, 7)
+    rect(cr, 360, 290, 720, 52, INK); wordmark(cr, 384, 325, 20)
+    pill(cr, 870, 305, 190, 'NEEDS AN ANSWER', SUN)
+    boot = st.off_kind == 'reboot'
+    w = text(cr, 404, 420, 'REBOOT ' if boot else 'SHUT ', 36, INK, SERIF, HEADW)
+    w += wordmark(cr, 404 + w, 420, 38)
+    text(cr, 404 + w, 420, '?' if boot else ' DOWN?', 36, INK, SERIF, HEADW)
+    text(cr, 404, 458, 'agents finish what they are writing, then it ' + ('starts again' if boot else 'powers off'), 16, INK, MONO, 500)
+    pill(cr, 404, 496, 132, 'Y · YES', INK, SUN, 44, 17, None, 2)
+    pill(cr, 550, 496, 132, 'N · NO', None, INK, 44, 17, INK, 2)
+    text(cr, 1056, 525, f'goes away in {int(left) + 1} s', 16, INK, MONO, 500, 'end')
+
+
+def bubbles(cr, st, slots, n, wrong_n, active=True, r=24):
+    """One bubble at the start. Each key fills one and shows the next empty one. slots gives the centre of bubble i.
+    Ready for a key: the empty bubble's ring breathes, bright then soft, once a second.
+    Not this row's turn, or being checked: the ring is dull and still; checked ones turn lilac.
+    Wrong: they all empty to dull rings and shake from side to side, then one bubble is left."""
+    now = time.time(); wrong = st.wrong_until > now
+    if wrong: n = wrong_n
+    count = n if wrong else n + 1
+    dx = 12 * math.sin((st.wrong_until - now) * 42) if wrong else 0
+    lw = 4 if r > 18 else 3
+    for i in range(count):
+        cx, cy = slots(i, count)
+        cr.arc(cx + dx, cy, r, 0, 6.2832)
+        if wrong:
+            cr.set_source_rgb(*rgb(INK)); cr.fill_preserve(); cr.set_source_rgb(*rgb(DUSK)); cr.set_line_width(lw)
+        elif i < n:
+            cr.set_source_rgb(*rgb(ACC if st.checking else SUN)); cr.fill_preserve(); cr.set_source_rgb(*rgb(INK)); cr.set_line_width(lw)
+        else:
+            cr.set_source_rgb(*rgb(INK)); cr.fill_preserve()
+            if st.checking or not active: cr.set_source_rgba(*rgb(DUSK), 0.6); cr.set_line_width(lw - 1)
+            elif int(now) % 2 == 0: cr.set_source_rgb(*rgb(ACC)); cr.set_line_width(lw + 1)
+            else: cr.set_source_rgba(*rgb(ACC), 0.5); cr.set_line_width(lw - 1)
+        cr.stroke()
+
+
+def centred(cx, y, per, gap, dy):
+    """Places for bubbles centred on cx however many there are: per to a line, then the next line."""
+    def slot(i, n):
+        row = i // per; inrow = min(per, n - row * per)
+        return cx - (inrow - 1) * gap / 2 + (i % per) * gap, y + row * dy
+    return slot
+
+
+def take_key(st, name, u):
+    """One key for the two rows: the name first (small bubbles), then the password. True when it is time to check."""
+    if name in ('Return', 'KP_Enter', 'Tab'):
+        if st.stage == 0:
+            if st.user: st.stage = 1
+        elif st.typed and name != 'Tab': return True
+    elif name == 'BackSpace':
+        if st.stage == 1 and not st.typed: st.stage = 0
+        elif st.stage == 1: st.typed = st.typed[:-1]
+        else: st.user = st.user[:-1]
+    elif name == 'Escape': st.user = st.typed = ''; st.stage = 0
+    elif u >= 32 and u != 127:                     # 127 is the Delete key: no invisible character
+        if st.stage == 0 and len(st.user) < 64: st.user += chr(u)
+        elif st.stage == 1 and len(st.typed) < 256: st.typed += chr(u)
+    return False
+
+
+def draw_login(cr, st, cells, turtle):
+    """The login: the square in the middle. The name lies over the pattern and behind the turtle, and starts
+    outside the square on the left. The bubbles lie over the turtle, lower right, and run out of the square."""
+    cr.set_source_rgb(*rgb(INK)); cr.paint()
+    if cells: cr.set_source_surface(cells, 0, 0); cr.paint()
+    wordmark(cr, 236, 262, 150)
+    if turtle: cr.set_source_surface(turtle, 0, 0); cr.paint()
+    # three to a row inside the square, then three more beyond its right edge, then the next line
+    # the name: small bubbles, a line above. The password: large ones, as before.
+    bubbles(cr, st, lambda i, _n: (855 + (i % 12) * 40, 646 + (i // 12) * 36), len(st.user), st.wrong_u, st.stage == 0, 13)
+    bubbles(cr, st, lambda i, _n: (863 + (i % 6) * 76, 716 + (i // 6) * 64), len(st.typed), st.wrong_n, st.stage == 1)
+
+
+def draw_rest(cr, st, lock=False):
+    """The resting screen: the turtle large, the time, three figures. Any key wakes the deck.
+    Locked, it shows the word and the bubbles that fill as the password is typed. Nothing else is said."""
+    total, free, _a, _s = st.memory()
+    x = 800
+    pill(cr, x, 96, 118 if lock else 130, 'LOCKED' if lock else 'RESTING', ACC, INK, 34, 15, None, 2)
+    text(cr, x - 6, 300, time.strftime('%H:%M:%S'), 118, SUN, MONO, 600, spacing=2)
+    text(cr, x, 356, time.strftime('%A %d %B %Y').upper(), 22, LEAF2, MONO, 600, spacing=2)
+    cr.set_source_rgb(*rgb(LEAF)); cr.set_line_width(2); cr.move_to(x, 396); cr.line_to(1370, 396); cr.stroke()
+    if lock:
+        # the password only (the name is asked at the login, not here), centred however many there are
+        bubbles(cr, st, centred(x + 285, 480, 7, 76, 64), len(st.typed), st.wrong_n)
+    else:
+        n = st.agents
+        for i, (k, v) in enumerate(((f"{n} agent{'' if n == 1 else 's'}", 'running' if n else 'none running'),
+                                    (f'{gb(free)} GB', f'free of {gb(total)}'), (f'{round(st.load * 100)}%', 'processor'))):
+            text(cr, x, 452 + i * 50, k, 30, ACC if i == 0 and n else SUN, MONO, 600); text(cr, x + 190, 452 + i * 50, v, 19, LEAF2)
+        text(cr, x, 640, 'Nothing needs you', 30, SUN, MONO, 600)
+        text(cr, 1370, 800, 'any key wakes the deck', 18, LEAF2, MONO, 400, 'end')
+    wordmark(cr, x, 802, 30)
+
+
+def load_art(path=None):
+    try: return cairo.ImageSurface.create_from_png(path or ART)
+    except Exception: return None
+
+
+def frame(cr, art, w, h, st, rest_art=None, lock=False):
+    cr.scale(w / W, h / H)
+    lock = lock or st.locked
+    if st.resting or lock:
+        cr.set_source_rgb(*rgb(INK)); cr.paint()
+        if rest_art: cr.set_source_surface(rest_art, 0, 0); cr.paint()
+        draw_rest(cr, st, lock); return
+    cr.set_source_rgb(*rgb(GROUND)); cr.paint()
+    if art: cr.set_source_surface(art, 0, 0); cr.paint()
+    draw(cr, st)
+
+
+def greetd(msg):
+    """One question to greetd, the login manager, and its answer. Its own small protocol: a length, then JSON."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+        c.connect(os.environ['GREETD_SOCK'])
+        return greetd_on(c, msg)
+
+
+def greetd_on(c, msg):
+    raw = json.dumps(msg).encode(); c.sendall(struct.pack('=I', len(raw)) + raw)
+    head = b''
+    while len(head) < 4:
+        part = c.recv(4 - len(head))
+        if not part: return {'type': 'error', 'description': 'no answer'}
+        head += part
+    need = struct.unpack('=I', head)[0]; body = b''
+    while len(body) < need:
+        part = c.recv(need - len(body))
+        if not part: break
+        body += part
+    return json.loads(body or b'{}')
+
+
+def login(user, word, start):
+    """Asks greetd to log user in with word and, when it agrees, to start the deck. True when it did."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+            c.settimeout(30); c.connect(os.environ['GREETD_SOCK'])
+            r = greetd_on(c, {'type': 'create_session', 'username': user})
+            for _ in range(4):                     # it may ask more than once; every hidden question gets the word
+                if r.get('type') != 'auth_message': break
+                r = greetd_on(c, {'type': 'post_auth_message_response',
+                                  'response': word if r.get('auth_message_type') == 'secret' else None})
+            if r.get('type') == 'success':
+                return greetd_on(c, {'type': 'start_session', 'cmd': start, 'env': []}).get('type') == 'success'
+            greetd_on(c, {'type': 'cancel_session'})
+    except (OSError, KeyError, ValueError): pass
+    return False
+
+
+def greeter():
+    """The login screen. It runs before anyone is logged in, takes the password, and hands over to the deck."""
+    gi.require_version('Gtk', '3.0'); gi.require_version('Gdk', '3.0')
+    from gi.repository import Gtk, Gdk, GLib
+    GLib.set_prgname('caretta-login')
+    st = State(); cells, turtle = load_art(LOGIN_CELLS), load_art(LOGIN_TURTLE)
+    win = Gtk.Window(title='caretta-login'); area_w = Gtk.DrawingArea(); win.add(area_w)
+
+    def on_draw(_w, cr):
+        a = area_w.get_allocation(); cr.scale(a.width / W, a.height / H); draw_login(cr, st, cells, turtle)
+
+    def tick(): area_w.queue_draw(); return True
+
+    def check(user, word):
+        try: ok = login(user, word, ['/usr/local/bin/kimera-deck'])
+        except Exception: ok = False               # any fault counts as a wrong password; the screen is never left stuck
+        def done():
+            st.checking = False; st.typed = st.user = ''; st.stage = 0
+            if ok: Gtk.main_quit(); return False   # greetd starts the deck once this screen has gone
+            st.wrong_n = len(word); st.wrong_u = len(user); st.wrong_until = time.time() + 0.7
+            def shake(): area_w.queue_draw(); return st.wrong_until > time.time()
+            GLib.timeout_add(30, shake); area_w.queue_draw(); return False
+        GLib.idle_add(done)
+
+    def on_key(_w, ev):
+        name = Gdk.keyval_name(ev.keyval)
+        if st.checking or st.wrong_until > time.time(): return True
+        if take_key(st, name, Gdk.keyval_to_unicode(ev.keyval)):
+            st.checking = True; threading.Thread(target=check, args=(st.user, st.typed), daemon=True).start()
+        area_w.queue_draw(); return True
+
+    area_w.connect('draw', on_draw); win.connect('key-press-event', on_key); win.connect('destroy', Gtk.main_quit)
+    GLib.timeout_add_seconds(1, tick); win.show_all(); Gtk.main()
+
+
+def window():
+    gi.require_version('Gtk', '3.0'); gi.require_version('Gdk', '3.0')
+    from gi.repository import Gtk, Gdk, GLib
+    GLib.set_prgname('caretta-deck')
+    st, art, rest_art = State(), load_art(), load_art(REST_ART)
+    win = Gtk.Window(title='caretta-deck'); area_w = Gtk.DrawingArea(); win.add(area_w)
+
+    def on_draw(_w, cr):
+        a = area_w.get_allocation(); frame(cr, art, a.width, a.height, st, rest_art)
+
+    beat = [0]
+
+    def check(user, word):                         # off the drawing thread: the system waits a moment on a wrong word
+        try: ok = password_ok(word)
+        except Exception: ok = False               # any fault counts as a wrong password; the screen is never left stuck
+        def done():
+            st.checking = False; st.typed = st.user = ''; st.stage = 1
+            if ok: st.locked = False; st.msg = 'unlocked'; st.last_key = time.time()
+            else:                                  # shake for a moment, drawn quickly only while it lasts
+                st.wrong_n = len(word); st.wrong_u = len(user); st.wrong_until = time.time() + 0.7
+                def shake(): area_w.queue_draw(); return st.wrong_until > time.time()
+                GLib.timeout_add(30, shake)
+            area_w.queue_draw(); return False
+        GLib.idle_add(done)
+
+    def rest(on):                                  # resting dims the screen; it never turns it off
+        st.resting = on; st.last_key = time.time()
+        try: subprocess.Popen(['brightnessctl', '-q', '-s', 'set', '25%'] if on else ['brightnessctl', '-q', '-r'])
+        except OSError: pass
+
+    def tick():                                    # the clock moves every second; the machine is read every other one
+        beat[0] += 1
+        if beat[0] % 2 == 0: st.sample()
+        if not st.resting and not st.locked and time.time() - st.last_key > REST_AFTER and st.off_until < time.time(): rest(True)
+        area_w.queue_draw(); return True
+
+    def on_key(_w, ev):
+        k = Gdk.keyval_name(ev.keyval).lower()
+        if st.locked:                              # every key belongs to the lock
+            name = Gdk.keyval_name(ev.keyval)
+            if st.checking or st.wrong_until > time.time(): return True    # not ready: keys are not taken
+            if take_key(st, name, Gdk.keyval_to_unicode(ev.keyval)):
+                st.checking = True; threading.Thread(target=check, args=(st.user, st.typed), daemon=True).start()
+            st.stage = 1                           # the lock has the password row only
+            area_w.queue_draw(); return True
+        if st.resting: rest(False); st.msg = 'awake'; area_w.queue_draw(); return True     # any key wakes; it does nothing else
+        st.last_key = time.time()
+        if st.off_until > time.time():             # the question is open: only Y and N count
+            if k == 'y':
+                st.off_until = 0; st.msg = 'rebooting' if st.off_kind == 'reboot' else 'shutting down'
+                subprocess.Popen(['/usr/local/bin/kimera-poweroff'] + (['reboot'] if st.off_kind == 'reboot' else []))
+            elif k in ('n', 'escape'): st.off_until = 0; st.msg = 'staying on'
+        elif k == 'o': st.off_kind = 'off'; st.off_until = time.time() + 15
+        elif k == 'b': st.off_kind = 'reboot'; st.off_until = time.time() + 15
+        elif k == 'd': os.execv(sys.executable, [sys.executable] + sys.argv)   # the deck starts afresh; nothing else stops
+        elif k == 't': st.msg = 'a terminal'; subprocess.Popen(['foot', '--app-id=kimera-term', 'su', '-', pwd.getpwuid(os.getuid()).pw_name])   # asks the password
+        elif k == 'l':
+            if pam():
+                subprocess.run(['swaymsg', '[app_id="kimera-term"] kill'], capture_output=True)    # no terminal stays over the lock
+                st.locked = True; st.typed = st.user = ''; st.stage = 1; st.msg = 'locked'
+            else: st.msg = 'cannot lock: no password check here'
+        elif k == 'r': rest(True)
+        elif k in ('y', 'n'): st.msg = 'no agent is asking'
+        elif k in ('p', 's'): st.msg = 'no agent is running'
+        else: return False
+        area_w.queue_draw(); return True
+
+    hover = [None]
+
+    def on_move(_w, ev):                           # drawn again only when the pointer enters or leaves a place with words
+        a = area_w.get_allocation(); mx, my = ev.x * W / a.width, ev.y * H / a.height
+        hit = next((k for k in range(len(st.zones) - 1, -1, -1)
+                    if st.zones[k][0] <= mx <= st.zones[k][0] + st.zones[k][2] and st.zones[k][1] <= my <= st.zones[k][1] + st.zones[k][3]), None)
+        st.mouse = (mx, my)
+        if hit != hover[0]: hover[0] = hit; area_w.queue_draw()
+
+    def on_leave(_w, _ev): st.mouse = None; hover[0] = None; area_w.queue_draw()
+
+    def on_scroll(_w, ev):                         # the wheel or two fingers, over the tasks, moves down the list
+        if not st.mouse or not (18 <= st.mouse[0] <= 898 and 704 <= st.mouse[1] <= 882): return False
+        ok, _dx, dy = ev.get_scroll_deltas()
+        step = (1 if dy > 0 else -1) if ok and dy else {Gdk.ScrollDirection.DOWN: 1, Gdk.ScrollDirection.UP: -1}.get(ev.direction, 0)
+        st.scroll = max(0, min(st.scroll + step, max(0, len(st.procs) - 4))); area_w.queue_draw(); return True
+
+    area_w.add_events(Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK | Gdk.EventMask.SCROLL_MASK | Gdk.EventMask.SMOOTH_SCROLL_MASK)
+    area_w.connect('motion-notify-event', on_move); area_w.connect('leave-notify-event', on_leave); area_w.connect('scroll-event', on_scroll)
+    area_w.connect('draw', on_draw); win.connect('key-press-event', on_key); win.connect('destroy', Gtk.main_quit)
+    GLib.timeout_add_seconds(1, tick); win.show_all(); Gtk.main()
+
+
+if __name__ == '__main__':
+    if len(sys.argv) >= 3 and sys.argv[1] == '--png':
+        st = State()
+        for _ in range(8): time.sleep(0.3); st.sample()
+        if '--off' in sys.argv: st.off_until = time.time() + 12; st.off_kind = os.environ.get('KIMERA_KIND', 'off')
+        st.resting = '--rest' in sys.argv
+        if os.environ.get('KIMERA_MOUSE'): st.mouse = tuple(float(v) for v in os.environ['KIMERA_MOUSE'].split(','))
+        st.scroll = int(os.environ.get('KIMERA_SCROLL', '0'))
+        if '--lock' in sys.argv: st.locked = True; st.typed = 'x' * int(os.environ.get('KIMERA_TYPED', '3'))
+        mode = os.environ.get('KIMERA_STATE', '')
+        st.user = 'x' * int(os.environ.get('KIMERA_NAME', '6')); st.stage = int(os.environ.get('KIMERA_STAGE', '1'))
+        def pose():
+            if mode == 'checking': st.checking = True
+            if mode == 'wrong': st.wrong_n = len(st.typed); st.wrong_u = len(st.user); st.typed = st.user = ''; st.wrong_until = time.time() + 0.662
+        if '--lock' in sys.argv: pose()
+        if '--login' in sys.argv:
+            st.typed = 'x' * int(os.environ.get('KIMERA_TYPED', '5')); pose()
+            surf = cairo.ImageSurface(cairo.FORMAT_RGB24, 1440, 900)
+            draw_login(cairo.Context(surf), st, load_art(LOGIN_CELLS), load_art(LOGIN_TURTLE)); surf.write_to_png(sys.argv[2]); sys.exit(0)
+        surf = cairo.ImageSurface(cairo.FORMAT_RGB24, 1440, 900)
+        frame(cairo.Context(surf), load_art(), 1440, 900, st, load_art(REST_ART)); surf.write_to_png(sys.argv[2])
+    elif len(sys.argv) >= 2 and sys.argv[1] == '--greeter': greeter()
+    else: window()

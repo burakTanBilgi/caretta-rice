@@ -1,0 +1,11 @@
+# Caretta's login under sway: one window filling the screen, run by greetd before anyone is logged in.
+xwayland disable
+default_border none
+focus_follows_mouse no
+seat * hide_cursor 3000
+input type:keyboard {
+    xkb_layout "@LAYOUT@"
+}
+output * bg #361534 solid_color
+# when the login screen goes, sway goes with it and greetd starts what was asked for
+exec sh -c 'GDK_BACKEND=wayland NO_AT_BRIDGE=1 /usr/local/bin/caretta-deck-panel --greeter; swaymsg exit'

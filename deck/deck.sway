@@ -1,0 +1,15 @@
+# Caretta's deck under sway: one window filling the screen. No bar, no workspaces, no idle timer: the screen stays on.
+xwayland disable
+default_border none
+default_floating_border pixel 3
+focus_follows_mouse no
+focus_on_window_activation none          # a new window never takes the keyboard from the deck or its lock
+seat * hide_cursor 3000
+input type:keyboard {
+    xkb_layout "@LAYOUT@"
+}
+client.focused #B890E6 #361534 #f1efe9 #B890E6 #B890E6
+for_window [app_id="kimera-term"] floating enable, resize set 1200 700, move position center
+output * bg #f1efe9 solid_color
+# if the deck's window ever closes, sway closes with it, so the screen is never left empty
+exec sh -c '/usr/local/bin/caretta-deck-panel; swaymsg exit'

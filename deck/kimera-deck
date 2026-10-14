@@ -1,0 +1,4 @@
+#!/bin/sh
+# kimera-deck: starts Caretta's deck (sway) from the text login. Quit it and the text login is back.
+export XDG_CURRENT_DESKTOP=sway XDG_SESSION_TYPE=wayland GDK_BACKEND=wayland NO_AT_BRIDGE=1
+exec sway -c /etc/kimera/deck.sway > "${XDG_RUNTIME_DIR:-/tmp}/kimera-deck.log" 2>&1

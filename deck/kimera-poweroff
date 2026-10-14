@@ -1,0 +1,7 @@
+#!/bin/sh
+# kimera-poweroff [reboot]: writes the disks, then powers the machine off or starts it again.
+# Needs the polkit rule from poweroff-install.sh, not sudo.
+logger -t kimera-poweroff "shutdown asked by ${USER:-?}"
+sync
+[ "${1:-}" = reboot ] && exec systemctl reboot
+exec systemctl poweroff
